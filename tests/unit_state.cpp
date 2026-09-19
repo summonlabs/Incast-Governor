@@ -282,6 +282,88 @@ IG_TEST(durable, checkpointing_rotates_the_journal_without_losing_state) {
     IG_CHECK_EQ(report.value().state.generation.value(), latest.generation.value());
 }
 
+IG_TEST(durable, journal_rotation_indices_are_ordered_numerically) {
+    TempDirectory directory("ordering");
+    DurableConfig config{};
+    config.directory = directory.path();
+    config.max_journal_records_before_snapshot = 1'000'000;
+
+    // Two surviving journals, numbered 2 and 10. Lexicographic ordering would
+    // replay "governor.10.journal" before "governor.2.journal"; numeric ordering
+    // must apply the higher rotation last.
+    GovernorState older = make_state_with_intervention();
+    older.generation = StateGeneration{2};
+    older.evaluation_count = 2;
+    GovernorState newer = make_state_with_intervention();
+    newer.generation = StateGeneration{10};
+    newer.evaluation_count = 10;
+
+    const auto write_journal = [&directory](std::uint64_t rotation, const GovernorState& state) {
+        std::vector<std::byte> header;
+        for (const char character : std::string_view("IGJRNL01")) {
+            header.push_back(static_cast<std::byte>(static_cast<unsigned char>(character)));
+        }
+        header.push_back(static_cast<std::byte>(kJournalFormatVersion & 0xFFu));
+        header.push_back(static_cast<std::byte>((kJournalFormatVersion >> 8) & 0xFFu));
+        header.push_back(std::byte{0});
+        header.push_back(std::byte{0});
+        const auto payload = encode_state(state);
+        const auto record = encode_journal_record(JournalRecordType::StateCommit, payload);
+        header.insert(header.end(), record.begin(), record.end());
+        const auto path = directory.path() / ("governor." + std::to_string(rotation) + ".journal");
+        IG_REQUIRE(static_cast<bool>(write_file_atomic(path, header, true)));
+    };
+
+    write_journal(2, older);
+    write_journal(10, newer);
+
+    DurableStore store;
+    IG_REQUIRE(static_cast<bool>(store.open(config)));
+    auto report = store.recover();
+    IG_REQUIRE(report.has_value());
+    IG_CHECK_EQ(report.value().journal_records_applied, 2u);
+    IG_CHECK_EQ(report.value().state.generation.value(), 10u);
+    IG_CHECK_EQ(report.value().state.evaluation_count, 10u);
+}
+
+IG_TEST(durable, reopening_never_overwrites_the_recovered_journal) {
+    TempDirectory directory("reopen");
+    DurableConfig config{};
+    config.directory = directory.path();
+    config.max_journal_records_before_snapshot = 1;
+
+    {
+        DurableStore store;
+        IG_REQUIRE(static_cast<bool>(store.open(config)));
+        for (int index = 0; index < 3; ++index) {
+            GovernorState state = make_state_with_intervention();
+            state.generation = StateGeneration{static_cast<std::uint64_t>(index) + 1};
+            IG_REQUIRE(static_cast<bool>(store.commit(state)));
+        }
+    }
+
+    DurableStore reopened;
+    IG_REQUIRE(static_cast<bool>(reopened.open(config)));
+    auto first = reopened.recover();
+    IG_REQUIRE(first.has_value());
+    IG_CHECK_EQ(first.value().state.generation.value(), 3u);
+
+    GovernorState next = first.value().state;
+    next.generation = StateGeneration{4};
+    const auto recovered_journal = reopened.journal_path();
+    IG_REQUIRE(static_cast<bool>(reopened.commit(next)));
+    // A rotation after recovery must claim a fresh file name: reusing the
+    // journal that was just read would destroy records a crash could still need.
+    IG_CHECK(reopened.journal_path() != recovered_journal);
+    IG_CHECK(std::filesystem::exists(reopened.journal_path()));
+
+    DurableStore third;
+    IG_REQUIRE(static_cast<bool>(third.open(config)));
+    auto second = third.recover();
+    IG_REQUIRE(second.has_value());
+    IG_CHECK_EQ(second.value().state.generation.value(), 4u);
+}
+
 IG_TEST(durable, oversized_payload_is_refused_before_it_reaches_disk) {
     TempDirectory directory("oversize");
     DurableConfig config{};

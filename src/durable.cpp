@@ -325,22 +325,33 @@ Outcome<RecoveryReport> DurableStore::recover() {
         }
     }
 
-    std::vector<std::filesystem::path> journals;
+    // Journals are ordered by their numeric rotation index, not by their file
+    // name: lexicographic ordering would place "governor.10.journal" before
+    // "governor.9.journal" and replay records out of order.
+    std::vector<std::pair<std::uint64_t, std::filesystem::path>> journals;
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(config_.directory, error)) {
         if (error) break;
         const std::string name = entry.path().filename().string();
-        if (name.rfind("governor.", 0) == 0 && entry.path().extension() == ".journal") {
-            journals.push_back(entry.path());
-        }
+        if (name.rfind("governor.", 0) != 0 || entry.path().extension() != ".journal") continue;
+        const std::string digits = name.substr(std::string("governor.").size(),
+                                               name.size() - std::string("governor.").size() -
+                                                   std::string(".journal").size());
+        const auto index = parse_u64(digits);
+        journals.emplace_back(index.value_or(0), entry.path());
     }
     if (error) return Error{ErrorCode::IoFailure, "unable to enumerate the durable state directory"};
-    std::sort(journals.begin(), journals.end());
+    std::sort(journals.begin(), journals.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
 
     if (!journals.empty()) report.journal_present = true;
-    if (!journals.empty()) journal_path_ = journals.back();
+    if (!journals.empty()) {
+        journal_path_ = journals.back().second;
+        journal_epoch_ = journals.back().first;
+    }
 
-    for (const auto& path : journals) {
+    for (const auto& [rotation, path] : journals) {
+        static_cast<void>(rotation);
         auto content = read_file(path);
         if (!content) {
             report.notes.emplace_back("journal could not be read: " + path.filename().string());
