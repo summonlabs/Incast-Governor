@@ -1,0 +1,14 @@
+# Normalise line endings so the repository builds identically on every host.
+* text=auto eol=lf
+
+# Windows build-system files keep CRLF.
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.vcxproj.filters text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets are never normalised.
+*.png binary
+*.jpg binary
+*.ico binary

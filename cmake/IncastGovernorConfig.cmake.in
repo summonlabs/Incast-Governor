@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(WIN32)
+    # Winsock is part of the platform SDK and needs no find_package call, but the
+    # imported target records the dependency so downstream consumers link it.
+    set(IncastGovernor_WINSOCK_LIBRARY ws2_32)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/IncastGovernorTargets.cmake")
+
+check_required_components(IncastGovernor)
