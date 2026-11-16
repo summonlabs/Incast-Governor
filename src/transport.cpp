@@ -243,6 +243,11 @@ void Connection::shutdown_both() {
     if (!valid()) return;
 #if defined(_WIN32)
     ::shutdown(static_cast<SOCKET>(handle_), SD_BOTH);
+    // On Windows a shutdown fails later receives but leaves one that is already
+    // blocked where it is until the peer acts or the connection times out,
+    // which takes two minutes against a peer that stays connected and silent.
+    // Cancelling the pending receive is what returns the blocked thread.
+    ::CancelIoEx(reinterpret_cast<HANDLE>(handle_), nullptr);
 #else
     ::shutdown(static_cast<int>(handle_), SHUT_RDWR);
 #endif

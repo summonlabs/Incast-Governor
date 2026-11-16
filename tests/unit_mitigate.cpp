@@ -126,6 +126,61 @@ IG_TEST(mitigate, saturated_population_forbids_sender_scoped_penalization) {
     IG_CHECK(result.intent.insufficient);
 }
 
+IG_TEST(mitigate, a_destination_scoped_reduction_never_comes_out_of_protected_demand) {
+    // Every sender carries a protected obligation, and the offer exceeds the
+    // destination by an amount a destination-wide admission cut could close.
+    auto spec = synthetic::synchronized_burst(32);
+    spec.protected_senders = 32;
+    spec.service_rate = Rate{20'000'000'000ULL};
+
+    GovernorPolicy policy = make_default_policy();
+    const SynthesisResult escalated = run_synthesis(spec, policy);
+    IG_REQUIRE(escalated.authority.intervention_authorized);
+    IG_CHECK(escalated.intent.required_reduction.positive());
+    // Nothing can be removed without taking it from protected senders, so the
+    // intent removes nothing and escalates.
+    IG_CHECK_EQ(escalated.intent.admission_reduction_bp.value(), 0u);
+    IG_CHECK_EQ(escalated.intent.achievable_reduction.bytes_per_second(), 0u);
+    IG_CHECK(escalated.intent.penalized_senders.empty());
+    IG_CHECK(escalated.intent.insufficient);
+    IG_CHECK(escalated.intent.escalating);
+    IG_CHECK(escalated.intent.kind == MitigationKind::CongestionEscalation);
+
+    policy.protection.escalate_instead_of_violating_floor = false;
+    const SynthesisResult refused = run_synthesis(spec, policy);
+    IG_CHECK(!refused.authority.intervention_authorized);
+    IG_CHECK(refused.authority.refusal == RefusalReason::ProtectedFloorConflict);
+    IG_CHECK(!refused.intent.active());
+}
+
+IG_TEST(mitigate, a_destination_scoped_reduction_is_bounded_by_unprotected_demand) {
+    // A saturated population: 48 of 64 senders were observed, 40 of them
+    // protected. Only eight senders' worth of demand may be reduced.
+    auto spec = synthetic::synchronized_burst(64);
+    spec.omit_senders = 16;
+    spec.mark_population_saturated = true;
+    spec.protected_senders = 40;
+    spec.service_rate = Rate{30'000'000'000ULL};
+
+    const auto policy = make_default_policy();
+    const auto bundle = synthetic::build(spec);
+    const Classification classification = classify(bundle, policy, detect_collisions(bundle));
+    const std::uint64_t unprotected = classification.metrics.penalizable_offered.bytes_per_second();
+    IG_CHECK_EQ(unprotected, 8'000'000'000ULL);
+
+    const SynthesisResult result = run_synthesis(spec, policy);
+    IG_REQUIRE(result.authority.intervention_authorized);
+    IG_CHECK(result.intent.scope == MitigationScope::Destination);
+    IG_CHECK(result.intent.penalized_senders.empty());
+    IG_CHECK(result.intent.required_reduction.bytes_per_second() > unprotected);
+    IG_CHECK(result.intent.achievable_reduction.bytes_per_second() <= unprotected);
+    IG_CHECK(result.intent.resulting_offered.bytes_per_second() >=
+             classification.metrics.protected_offered.bytes_per_second());
+    // The rest of the gap is escalated, not taken from protected senders.
+    IG_CHECK(result.intent.insufficient);
+    IG_CHECK(result.intent.escalating);
+}
+
 IG_TEST(mitigate, identity_collision_excludes_the_colliding_sender) {
     auto spec = synthetic::synchronized_burst(32);
     spec.duplicate_senders = 3;

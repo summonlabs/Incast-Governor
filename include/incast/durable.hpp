@@ -26,6 +26,11 @@ enum class JournalRecordType : std::uint16_t {
     EpochAdvance = 7,
 };
 
+// A journal record carries one whole encoded state, so its payload is bounded
+// as the state container is. kMaxJournalRecordBytes bounds one intervention
+// inside that state; a state holds up to kMaxInterventions of them.
+inline constexpr std::size_t kMaxJournalPayloadBytes = kMaxJournalRecordBytes * 64;
+
 [[nodiscard]] constexpr std::string_view to_string(JournalRecordType type) noexcept {
     switch (type) {
         case JournalRecordType::StateCommit: return "StateCommit";

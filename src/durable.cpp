@@ -5,6 +5,7 @@
 #include "incast/durable.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -73,6 +74,134 @@ inline constexpr std::size_t kJournalFileHeaderBytes = 12;
                  << (index * 8);
     }
     return value;
+}
+
+// The journals of a directory in the order they were written. Journals are
+// ordered by their numeric rotation index, not by their file name:
+// lexicographic ordering would place "governor.10.journal" before
+// "governor.9.journal" and replay records out of order.
+[[nodiscard]] std::vector<std::pair<std::uint64_t, std::filesystem::path>> list_journals(
+    const std::filesystem::path& directory, std::error_code& error) {
+    std::vector<std::pair<std::uint64_t, std::filesystem::path>> journals;
+    const std::string prefix("governor.");
+    const std::string suffix(".journal");
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        if (error) break;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) != 0 || entry.path().extension() != suffix) continue;
+        if (name.size() < prefix.size() + suffix.size()) continue;
+        const std::string digits = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+        const auto index = parse_u64(digits);
+        journals.emplace_back(index.value_or(0), entry.path());
+    }
+    std::sort(journals.begin(), journals.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+    return journals;
+}
+
+// What reading one journal found.
+struct JournalScan {
+    bool readable = false;      // the file could be opened and read to its end
+    bool header_valid = false;  // it starts with the journal file header
+    bool damaged = false;       // something after the valid prefix did not decode
+    ErrorCode damage = ErrorCode::None;
+    std::uint64_t valid_bytes = 0;  // length of the prefix that decoded cleanly
+    std::uint64_t records = 0;      // records inside that prefix
+};
+
+// Reads one journal record by record and applies its committed states to the
+// report. Only one record is held in memory at a time, so a journal is bounded
+// by the records it may hold and not by what could be loaded at once: a journal
+// the store was allowed to write is always one recovery can read.
+[[nodiscard]] JournalScan scan_journal(const std::filesystem::path& path, RecoveryReport& report) {
+    JournalScan scan{};
+    const std::string name = path.filename().string();
+
+    std::error_code size_error;
+    const std::uintmax_t file_size = std::filesystem::file_size(path, size_error);
+    std::ifstream stream(path, std::ios::binary);
+    if (size_error || !stream) {
+        report.notes.emplace_back("journal could not be read: " + name);
+        return scan;
+    }
+    const std::uint64_t total = static_cast<std::uint64_t>(file_size);
+
+    std::array<char, kJournalFileHeaderBytes> file_header{};
+    stream.read(file_header.data(), static_cast<std::streamsize>(file_header.size()));
+    if (static_cast<std::size_t>(stream.gcount()) != file_header.size() ||
+        std::memcmp(file_header.data(), kJournalFileHeader.data(), kJournalFileHeader.size()) != 0) {
+        scan.readable = !stream.bad();
+        report.notes.emplace_back("journal header invalid: " + name);
+        return scan;
+    }
+    scan.readable = true;
+    scan.header_valid = true;
+    scan.valid_bytes = kJournalFileHeaderBytes;
+
+    const auto read_exact = [&stream](std::byte* destination, std::size_t count) {
+        stream.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(count));
+        return static_cast<std::size_t>(stream.gcount()) == count;
+    };
+
+    std::vector<std::byte> record;
+    while (scan.valid_bytes < total) {
+        const std::uint64_t remaining = total - scan.valid_bytes;
+        const std::size_t header_bytes =
+            static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kJournalRecordHeaderBytes));
+        record.resize(header_bytes);
+        bool complete = read_exact(record.data(), header_bytes);
+        if (complete && header_bytes == kJournalRecordHeaderBytes &&
+            read_u32(record, 0) == kJournalRecordMagic && read_u16(record, 4) == kJournalFormatVersion &&
+            read_u32(record, 8) <= kMaxJournalPayloadBytes) {
+            // The header is believed about its payload length only once it has
+            // passed the checks the decoder makes before it looks at a payload.
+            const std::size_t payload_bytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+                read_u32(record, 8), remaining - kJournalRecordHeaderBytes));
+            record.resize(kJournalRecordHeaderBytes + payload_bytes);
+            complete = read_exact(record.data() + kJournalRecordHeaderBytes, payload_bytes);
+        }
+        if (!complete) {
+            scan.readable = false;
+            report.notes.emplace_back("journal could not be read to its end: " + name);
+            return scan;
+        }
+
+        JournalRecordType type = JournalRecordType::StateCommit;
+        std::span<const std::byte> payload{};
+        std::size_t consumed = 0;
+        const Status decoded = decode_journal_record(record, type, payload, consumed);
+        if (!decoded) {
+            if (decoded.error().code == ErrorCode::TruncatedInput && remaining < kJournalRecordHeaderBytes) {
+                report.journal_tail_bytes_discarded += remaining;
+                report.notes.emplace_back("journal tail truncated mid-header; discarded");
+            } else if (decoded.error().code == ErrorCode::TruncatedInput ||
+                       decoded.error().code == ErrorCode::ChecksumMismatch) {
+                report.journal_tail_bytes_discarded += remaining;
+                report.journal_tail_ambiguous = true;
+                report.notes.emplace_back("journal tail is ambiguous; discarded rather than trusted");
+            } else {
+                report.journal_records_rejected += 1;
+                report.notes.emplace_back(std::string("journal record rejected: ") +
+                                          std::string(to_string(decoded.error().code)));
+            }
+            scan.damaged = true;
+            scan.damage = decoded.error().code;
+            return scan;
+        }
+        scan.valid_bytes += consumed;
+        scan.records += 1;
+        report.journal_records_applied += 1;
+        if (type == JournalRecordType::StateCommit) {
+            auto state = decode_state(payload);
+            if (!state) {
+                report.journal_records_rejected += 1;
+                continue;
+            }
+            report.state = state.value();
+            report.recovered_committed_state = true;
+        }
+    }
+    return scan;
 }
 
 }  // namespace
@@ -162,7 +291,7 @@ Status decode_journal_record(std::span<const std::byte> bytes,
     type = static_cast<JournalRecordType>(raw_type);
     const std::uint32_t length = read_u32(bytes, 8);
     const std::uint32_t checksum = read_u32(bytes, 12);
-    if (length > kMaxJournalRecordBytes) {
+    if (length > kMaxJournalPayloadBytes) {
         return fail(ErrorCode::OversizedInput, "journal record exceeds the supported bound");
     }
     if (bytes.size() < kJournalRecordHeaderBytes + length) {
@@ -231,7 +360,10 @@ Status DurableStore::rotate_journal() {
 
 Status DurableStore::append(JournalRecordType type, std::span<const std::byte> payload) {
     if (!open_) return fail(ErrorCode::Closed, "durable store is not open");
-    if (payload.size() > kMaxJournalRecordBytes) {
+    // The bound is the one recovery reads a record back under. A smaller one
+    // here would refuse every state that outgrew it, for good, while the state
+    // bound still called that state acceptable.
+    if (payload.size() > kMaxJournalPayloadBytes) {
         return fail(ErrorCode::OversizedInput, "journal payload exceeds the supported bound");
     }
     if (journal_path_.empty()) {
@@ -289,12 +421,17 @@ Status DurableStore::checkpoint(const GovernorState& state) {
     // preceded it is retired, otherwise a crash could lose committed state.
     const Status snapshot = write_snapshot_atomic(state);
     if (!snapshot) return snapshot;
-    const std::filesystem::path previous = journal_path_;
     const Status rotated = rotate_journal();
     if (!rotated) return rotated;
-    if (!previous.empty() && previous != journal_path_) {
+    // Every journal below the new one is superseded by the snapshot. All of
+    // them are removed, not only the one that was open: a journal whose removal
+    // failed at an earlier checkpoint, or was cut short by a crash, is retried
+    // here instead of being left behind for good.
+    std::error_code error;
+    for (const auto& [rotation, path] : list_journals(config_.directory, error)) {
+        if (rotation >= journal_epoch_ || path == journal_path_) continue;
         std::error_code ignored;
-        std::filesystem::remove(previous, ignored);
+        std::filesystem::remove(path, ignored);
     }
     return ok_status();
 }
@@ -325,78 +462,58 @@ Outcome<RecoveryReport> DurableStore::recover() {
         }
     }
 
-    // Journals are ordered by their numeric rotation index, not by their file
-    // name: lexicographic ordering would place "governor.10.journal" before
-    // "governor.9.journal" and replay records out of order.
-    std::vector<std::pair<std::uint64_t, std::filesystem::path>> journals;
     std::error_code error;
-    for (const auto& entry : std::filesystem::directory_iterator(config_.directory, error)) {
-        if (error) break;
-        const std::string name = entry.path().filename().string();
-        if (name.rfind("governor.", 0) != 0 || entry.path().extension() != ".journal") continue;
-        const std::string digits = name.substr(std::string("governor.").size(),
-                                               name.size() - std::string("governor.").size() -
-                                                   std::string(".journal").size());
-        const auto index = parse_u64(digits);
-        journals.emplace_back(index.value_or(0), entry.path());
-    }
+    const auto journals = list_journals(config_.directory, error);
     if (error) return Error{ErrorCode::IoFailure, "unable to enumerate the durable state directory"};
-    std::sort(journals.begin(), journals.end(),
-              [](const auto& left, const auto& right) { return left.first < right.first; });
-
     if (!journals.empty()) report.journal_present = true;
-    if (!journals.empty()) {
-        journal_path_ = journals.back().second;
-        journal_epoch_ = journals.back().first;
+
+    // A snapshot is written by a checkpoint, and the checkpoint starts a new
+    // journal right after it. Every journal below the newest one was therefore
+    // already complete when the snapshot was taken: the snapshot supersedes it,
+    // and it is only still here because its removal failed or was cut short.
+    // Replaying one would put a state back that is older than the snapshot, and
+    // it would stay in force whenever the newest journal holds no state yet.
+    std::size_t first = 0;
+    if (report.snapshot_loaded && journals.size() > 1) {
+        first = journals.size() - 1;
+        report.notes.emplace_back("journals superseded by the snapshot were not replayed");
     }
 
-    for (const auto& [rotation, path] : journals) {
-        static_cast<void>(rotation);
-        auto content = read_file(path);
-        if (!content) {
-            report.notes.emplace_back("journal could not be read: " + path.filename().string());
-            continue;
+    JournalScan newest{};
+    for (std::size_t index = first; index < journals.size(); ++index) {
+        const JournalScan scan = scan_journal(journals[index].second, report);
+        if (index + 1 == journals.size()) newest = scan;
+    }
+
+    if (!journals.empty()) {
+        journal_epoch_ = journals.back().first;
+        journal_path_ = journals.back().second;
+        records_since_snapshot_ = newest.records;
+
+        // The newest journal is the one later commits are appended to, and
+        // recovery stops at the first record it cannot read. Whatever follows
+        // such a record is never reached again, so nothing may be appended
+        // behind one.
+        if (!newest.readable) {
+            return Error{ErrorCode::IoFailure,
+                         "the newest journal could not be read; the state it holds cannot be recovered"};
         }
-        const auto bytes = content.value();
-        if (bytes.size() < kJournalFileHeaderBytes ||
-            std::memcmp(bytes.data(), kJournalFileHeader.data(), kJournalFileHeader.size()) != 0) {
-            report.notes.emplace_back("journal header invalid: " + path.filename().string());
-            continue;
-        }
-        std::size_t offset = kJournalFileHeaderBytes;
-        while (offset < bytes.size()) {
-            JournalRecordType type = JournalRecordType::StateCommit;
-            std::span<const std::byte> payload{};
-            std::size_t consumed = 0;
-            const Status decoded = decode_journal_record(
-                std::span<const std::byte>(bytes.data() + offset, bytes.size() - offset), type, payload, consumed);
-            if (!decoded) {
-                const std::size_t remaining = bytes.size() - offset;
-                if (decoded.error().code == ErrorCode::TruncatedInput && remaining < kJournalRecordHeaderBytes) {
-                    report.journal_tail_bytes_discarded += remaining;
-                    report.notes.emplace_back("journal tail truncated mid-header; discarded");
-                } else if (decoded.error().code == ErrorCode::TruncatedInput ||
-                           decoded.error().code == ErrorCode::ChecksumMismatch) {
-                    report.journal_tail_bytes_discarded += remaining;
-                    report.journal_tail_ambiguous = true;
-                    report.notes.emplace_back("journal tail is ambiguous; discarded rather than trusted");
-                } else {
-                    report.journal_records_rejected += 1;
-                    report.notes.emplace_back(std::string("journal record rejected: ") +
-                                              std::string(to_string(decoded.error().code)));
-                }
-                break;
+        if (!newest.header_valid) {
+            // Not a journal this store can append to: the next commit starts a
+            // new one above it.
+            journal_path_.clear();
+            records_since_snapshot_ = 0;
+        } else if (newest.damaged) {
+            if (newest.damage == ErrorCode::UnsupportedVersion) {
+                return Error{ErrorCode::UnsupportedVersion,
+                             "the newest journal holds records in a format this build does not read"};
             }
-            offset += consumed;
-            report.journal_records_applied += 1;
-            if (type == JournalRecordType::StateCommit) {
-                auto state = decode_state(payload);
-                if (!state) {
-                    report.journal_records_rejected += 1;
-                    continue;
-                }
-                report.state = state.value();
-                report.recovered_committed_state = true;
+            // The discarded tail is removed, so the journal ends with its last
+            // good record and the next commit follows it directly.
+            std::error_code resize_error;
+            std::filesystem::resize_file(journal_path_, newest.valid_bytes, resize_error);
+            if (resize_error) {
+                return Error{ErrorCode::IoFailure, "unable to remove the discarded journal tail"};
             }
         }
     }

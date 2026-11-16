@@ -275,7 +275,9 @@ IG_TEST(adversarial, coordinator_control_requires_the_token) {
 }
 
 IG_TEST(adversarial, durable_store_refuses_oversized_journal_payloads) {
-    std::vector<std::byte> payload(kMaxJournalRecordBytes + 1);
+    // One byte more than a journal record may carry, which is what a whole
+    // encoded state may occupy.
+    std::vector<std::byte> payload(kMaxJournalPayloadBytes + 1);
     const auto record = encode_journal_record(JournalRecordType::Checkpoint, payload);
     JournalRecordType type = JournalRecordType::Checkpoint;
     std::span<const std::byte> body{};

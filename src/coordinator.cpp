@@ -573,22 +573,57 @@ void Coordinator::stop() {
     }
 }
 
+void Coordinator::reap_finished_sessions() {
+    std::vector<std::thread::id> finished;
+    {
+        const std::lock_guard<std::mutex> guard(sessions_mutex_);
+        finished.swap(finished_);
+    }
+    if (finished.empty()) return;
+    for (auto iterator = workers_.begin(); iterator != workers_.end();) {
+        if (std::find(finished.begin(), finished.end(), iterator->get_id()) != finished.end()) {
+            // The thread has left its session and released sessions_mutex_; the
+            // join only waits for it to return.
+            iterator->join();
+            iterator = workers_.erase(iterator);
+        } else {
+            ++iterator;
+        }
+    }
+}
+
 Status Coordinator::run() {
+    Status result = ok_status();
+    const std::size_t bound = std::max<std::size_t>(config_.max_connections, 1);
     while (!stopping_.load()) {
         auto connection = listener_.accept();
         if (!connection) {
-            if (stopping_.load()) break;
-            return fail(connection.error().code, connection.error().detail);
+            // The sessions already being served are ended and joined below
+            // either way; a failed accept only decides what run() reports.
+            if (!stopping_.load()) result = fail(connection.error().code, connection.error().detail);
+            break;
         }
+        reap_finished_sessions();
         auto channel = std::make_shared<FramedChannel>(std::move(connection.value()));
+        bool admitted = false;
         {
             const std::lock_guard<std::mutex> guard(sessions_mutex_);
-            sessions_.push_back(channel);
+            if (sessions_.size() < bound) {
+                sessions_.push_back(channel);
+                admitted = true;
+            }
+        }
+        if (!admitted) {
+            // The bound on concurrent sessions is reached. The peer is turned
+            // away at once instead of being given a thread of its own.
+            channel->close();
+            continue;
         }
         workers_.emplace_back([this, channel]() {
             static_cast<void>(handle_connection(*channel));
             const std::lock_guard<std::mutex> guard(sessions_mutex_);
             sessions_.erase(std::remove(sessions_.begin(), sessions_.end(), channel), sessions_.end());
+            finished_.push_back(std::this_thread::get_id());
         });
     }
     listener_.close();
@@ -607,9 +642,10 @@ Status Coordinator::run() {
     {
         const std::lock_guard<std::mutex> guard(sessions_mutex_);
         sessions_.clear();
+        finished_.clear();
     }
     running_ = false;
-    return ok_status();
+    return result;
 }
 
 Status Coordinator::serve_one() {
@@ -624,16 +660,24 @@ EpochId Coordinator::epoch() const {
     return epoch_;
 }
 
-Status Coordinator::advance_epoch(std::string reason) {
-    const std::lock_guard<std::mutex> guard(mutex_);
-    epoch_ = EpochId{epoch_.value() + 1};
-    statistics_.epoch_advances += 1;
+Status Coordinator::advance_epoch_locked() {
+    // An epoch is issued only once the ledger holds it. Written the other way
+    // round, a ledger that cannot be written leaves an epoch in use that a
+    // restarted coordinator does not know about and hands out a second time.
+    const EpochId next{epoch_.value() + 1};
     if (ledger_open_) {
-        const Status stored = ledger_.store(epoch_);
+        const Status stored = ledger_.store(next);
         if (!stored) return stored;
     }
-    static_cast<void>(reason);
+    epoch_ = next;
+    statistics_.epoch_advances += 1;
     return ok_status();
+}
+
+Status Coordinator::advance_epoch(std::string reason) {
+    static_cast<void>(reason);
+    const std::lock_guard<std::mutex> guard(mutex_);
+    return advance_epoch_locked();
 }
 
 Coordinator::Statistics Coordinator::statistics() const {
@@ -659,32 +703,42 @@ Outcome<MessageLeaseGrant> Coordinator::grant_lease(const MessageLeaseRequest& r
     }
 
     const std::lock_guard<std::mutex> guard(mutex_);
-    bool superseded = false;
+    const auto holds = [&request](const LeaseRecord& record) {
+        return record.grant.boot == request.boot && record.grant.worker == request.worker;
+    };
+    LeaseRecord* held = nullptr;
+    bool contested = false;
     for (auto& [id, record] : leases_) {
         if (record.grant.destination != request.destination) continue;
         if (record.revoked) continue;
-        if (record.grant.boot != request.boot || record.grant.worker != request.worker) {
-            // A different live incarnation claims the same destination: the
-            // previous holder is fenced by an epoch advance.
-            record.revoked = true;
-            superseded = true;
+        if (holds(record)) {
+            held = &record;
         } else {
-            record.grant.attempt = request.attempt;
-            record.grant.granted_at = now;
-            record.grant.expires_at = Timestamp{now.nanos() + config_.lease_duration.nanos()};
-            record.grant.epoch = epoch_;
-            statistics_.leases_renewed += 1;
-            return record.grant;
+            contested = true;
         }
     }
 
-    if (superseded) {
-        epoch_ = EpochId{epoch_.value() + 1};
-        statistics_.epoch_advances += 1;
-        if (ledger_open_) {
-            const Status stored = ledger_.store(epoch_);
-            if (!stored) return Error{stored.error().code, stored.error().detail};
+    if (contested) {
+        // A different live incarnation claims the same destination: the
+        // previous holder is fenced by an epoch advance. The epoch moves first.
+        // If it cannot, nothing is revoked and the claim is refused: a holder is
+        // only superseded into an epoch that exists.
+        const Status advanced = advance_epoch_locked();
+        if (!advanced) return Error{advanced.error().code, advanced.error().detail};
+        for (auto& [id, record] : leases_) {
+            if (record.grant.destination != request.destination) continue;
+            if (record.revoked || holds(record)) continue;
+            record.revoked = true;
         }
+    }
+
+    if (held != nullptr) {
+        held->grant.attempt = request.attempt;
+        held->grant.granted_at = now;
+        held->grant.expires_at = Timestamp{now.nanos() + config_.lease_duration.nanos()};
+        held->grant.epoch = epoch_;
+        statistics_.leases_renewed += 1;
+        return held->grant;
     }
 
     MessageLeaseGrant grant{};
@@ -735,14 +789,20 @@ Status Coordinator::handle_control(FramedChannel& channel, const ControlRequest&
                 break;
             }
             case ControlOpcode::RevokeAll: {
+                Status advanced = ok_status();
                 {
                     const std::lock_guard<std::mutex> guard(mutex_);
-                    for (auto& [id, record] : leases_) record.revoked = true;
-                    epoch_ = EpochId{epoch_.value() + 1};
-                    statistics_.epoch_advances += 1;
+                    // Leases granted from here on carry the new epoch, so it is
+                    // made durable like every other advance. A coordinator that
+                    // is killed after this must restart above it.
+                    advanced = advance_epoch_locked();
+                    if (advanced) {
+                        for (auto& [id, record] : leases_) record.revoked = true;
+                    }
                 }
-                response.ok = true;
-                response.detail.assign("all leases revoked; epoch advanced");
+                response.ok = static_cast<bool>(advanced);
+                response.detail = advanced ? std::string("all leases revoked; epoch advanced")
+                                           : advanced.error().detail;
                 response.epoch = epoch();
                 break;
             }
@@ -798,7 +858,7 @@ Status Coordinator::handle_connection(FramedChannel& channel) {
                 auto hello = decode_hello(frame.value().payload);
                 if (!hello) return fail(hello.error().code, hello.error().detail);
                 MessageHelloAck ack{};
-                ack.session = next_session_++;
+                ack.session = next_session_.fetch_add(1);
                 ack.epoch = epoch();
                 ack.coordinator_boot = boot_;
                 Frame reply{};
@@ -908,12 +968,12 @@ Status Coordinator::handle_connection(FramedChannel& channel) {
                         ack.accepted = false;
                         ack.reason = RefusalReason::LeaseMissing;
                         ack.detail.assign("decision references a revoked lease");
-                    } else if (publish.value().epoch != epoch_) {
-                        ack.accepted = false;
-                        ack.reason = RefusalReason::EpochMismatch;
-                        ack.detail.assign("decision was produced under a superseded epoch");
-                        iterator->second.revoked = true;
                     } else if (iterator->second.grant.boot != publish.value().boot) {
+                        // Who is publishing is settled before anything is done
+                        // to the lease. A publish that only names a lease is
+                        // not its holder: a worker left over from an earlier
+                        // coordinator can name a lease number that has since
+                        // been granted to someone else.
                         ack.accepted = false;
                         ack.reason = RefusalReason::BootMismatch;
                         ack.detail.assign("decision was produced by a previous boot incarnation");
@@ -921,6 +981,13 @@ Status Coordinator::handle_connection(FramedChannel& channel) {
                         ack.accepted = false;
                         ack.reason = RefusalReason::EpochMismatch;
                         ack.detail.assign("decision was produced by a different worker");
+                    } else if (publish.value().epoch != epoch_) {
+                        // The holder itself is behind the epoch: its lease is
+                        // fenced.
+                        ack.accepted = false;
+                        ack.reason = RefusalReason::EpochMismatch;
+                        ack.detail.assign("decision was produced under a superseded epoch");
+                        iterator->second.revoked = true;
                     } else if (now > iterator->second.grant.expires_at) {
                         ack.accepted = false;
                         ack.reason = RefusalReason::LeaseExpired;

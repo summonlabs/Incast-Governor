@@ -363,11 +363,24 @@ SynthesisResult synthesize(const SynthesisRequest& request) {
         // No provable per-sender scope: a saturated population cannot prove
         // which senders are protected, so only a destination-scoped bounded
         // admission reduction is authorized.
-        const std::uint64_t needed_bp = saturating_mul(required, 10000ULL) / (aggregate == 0 ? 1 : aggregate);
-        admission_bp = clamp_bp(needed_bp, std::min<std::uint32_t>(bounds.min_reduction_bp,
-                                                                   bounds.max_admission_reduction_bp),
-                                bounds.max_admission_reduction_bp);
-        achievable = apply_bp(aggregate, admission_bp);
+        //
+        // A destination-wide reduction names no sender, so nothing in it keeps
+        // it away from protected ones. It is therefore sized against the demand
+        // that is not protected, and never above it: what it cannot remove from
+        // there is left as residual demand, which is escalated or refused below
+        // instead of being taken out of protected obligations.
+        const std::uint64_t reducible = metrics.penalizable_offered.bytes_per_second();
+        const std::uint64_t divisor = aggregate == 0 ? 1 : aggregate;
+        const std::uint64_t wanted = std::min(required, reducible);
+        const std::uint64_t ceiling_bp = saturating_mul(reducible, 10000ULL) / divisor;
+        if (wanted != 0 && ceiling_bp != 0) {
+            const std::uint64_t needed_bp = saturating_mul(wanted, 10000ULL) / divisor;
+            admission_bp = clamp_bp(needed_bp, std::min<std::uint32_t>(bounds.min_reduction_bp,
+                                                                       bounds.max_admission_reduction_bp),
+                                    bounds.max_admission_reduction_bp);
+            if (admission_bp > ceiling_bp) admission_bp = static_cast<std::uint32_t>(ceiling_bp);
+        }
+        achievable = std::min(apply_bp(aggregate, admission_bp), reducible);
         intent.kind = MitigationKind::TemporaryAdmissionReduction;
         intent.scope = MitigationScope::Destination;
         authority.intervention_authorized = true;

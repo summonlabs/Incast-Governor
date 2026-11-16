@@ -2,7 +2,11 @@
 // Copyright 2026 Summon Software Labs.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -323,4 +327,248 @@ IG_TEST(integration, heartbeat_reports_epoch_advances_to_the_worker) {
 
     worker.close();
     running.shutdown();
+}
+
+namespace {
+
+class LedgerDirectory {
+public:
+    explicit LedgerDirectory(const std::string& label) {
+        static std::uint64_t counter = 0;
+        counter += 1;
+        path_ = std::filesystem::temp_directory_path() /
+                ("incast-governor-ledger-" + label + "-" + std::to_string(counter));
+        std::error_code error;
+        std::filesystem::remove_all(path_, error);
+        std::filesystem::create_directories(path_, error);
+    }
+    ~LedgerDirectory() {
+        std::error_code error;
+        std::filesystem::remove_all(path_, error);
+    }
+    LedgerDirectory(const LedgerDirectory&) = delete;
+    LedgerDirectory& operator=(const LedgerDirectory&) = delete;
+    [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+private:
+    std::filesystem::path path_{};
+};
+
+WorkerConfig worker_config_for(const Coordinator& coordinator, const std::string& name,
+                               std::uint64_t destination) {
+    WorkerConfig config{};
+    config.coordinator_port = coordinator.port();
+    config.name = name;
+    config.boot = mint_boot_incarnation();
+    config.worker = mint_worker_id(name);
+    config.destination = DestinationId{destination};
+    config.destination_generation = DestinationGeneration{1};
+    return config;
+}
+
+// Publishes one authoritative decision under the worker's own grant.
+Outcome<MessageDecisionAck> publish_one(GovernorWorker& worker, const MessageLeaseGrant& grant) {
+    auto spec = synthetic::synchronized_burst(48);
+    spec.destination = grant.destination;
+    spec.epoch = grant.epoch;
+    spec.boot = grant.boot;
+    spec.worker = grant.worker;
+    spec.lease = grant.lease;
+    auto governor = igfixture::make_governor(spec, true);
+    return worker.publish(governor.evaluate(synthetic::build(spec)));
+}
+
+EpochId persisted_epoch(const std::filesystem::path& directory) {
+    EpochLedger ledger;
+    IG_REQUIRE(static_cast<bool>(ledger.open(directory)));
+    auto loaded = ledger.load();
+    IG_REQUIRE(loaded.has_value());
+    return loaded.value();
+}
+
+}  // namespace
+
+IG_TEST(integration, revoke_all_makes_the_new_epoch_durable) {
+    LedgerDirectory directory("revoke");
+    CoordinatorConfig config{};
+    config.control_token = "revoke-durable";
+    config.directory = directory.path();
+    RunningCoordinator running(config);
+    IG_REQUIRE(running.start());
+    const EpochId before = running.coordinator.epoch();
+    IG_CHECK_EQ(persisted_epoch(directory.path()).value(), before.value());
+
+    ControlRequest control{};
+    control.opcode = ControlOpcode::RevokeAll;
+    control.token = "revoke-durable";
+    auto response = send_control(running.coordinator.port(), control);
+    IG_REQUIRE(response.has_value());
+    IG_CHECK(response.value().ok);
+    const EpochId after = running.coordinator.epoch();
+    IG_CHECK(after > before);
+
+    // Leases are granted under the new epoch from here on. A coordinator that
+    // is killed now has to restart strictly above it, so it must be on disk.
+    IG_CHECK_EQ(persisted_epoch(directory.path()).value(), after.value());
+    running.shutdown();
+}
+
+IG_TEST(integration, an_epoch_that_cannot_be_made_durable_is_never_issued) {
+    LedgerDirectory directory("unwritable");
+    CoordinatorConfig config{};
+    config.control_token = "ledger-failure";
+    config.directory = directory.path();
+    config.lease_duration = Duration{5'000'000'000};
+    RunningCoordinator running(config);
+    IG_REQUIRE(running.start());
+
+    GovernorWorker holder(worker_config_for(running.coordinator, "holder", 31));
+    IG_REQUIRE(static_cast<bool>(holder.connect_and_handshake()));
+    auto grant = holder.acquire_lease();
+    IG_REQUIRE(grant.has_value());
+    const EpochId before = running.coordinator.epoch();
+
+    // From here the ledger cannot be rewritten: the name of its temporary file
+    // is taken by a directory.
+    std::error_code error;
+    std::filesystem::create_directories(directory.path() / "coordinator.epoch.tmp", error);
+    IG_REQUIRE(!error);
+
+    const Status advanced = running.coordinator.advance_epoch("ledger is unwritable");
+    IG_CHECK(!advanced);
+    IG_CHECK_EQ(running.coordinator.epoch().value(), before.value());
+
+    ControlRequest control{};
+    control.opcode = ControlOpcode::RevokeAll;
+    control.token = "ledger-failure";
+    auto response = send_control(running.coordinator.port(), control);
+    IG_REQUIRE(response.has_value());
+    IG_CHECK(!response.value().ok);
+    IG_CHECK_EQ(running.coordinator.epoch().value(), before.value());
+
+    // A second incarnation claiming the destination would need a new epoch to
+    // supersede the holder. It cannot have one, so it is refused and the holder
+    // keeps the authority it was granted.
+    GovernorWorker claimant(worker_config_for(running.coordinator, "claimant", 31));
+    IG_REQUIRE(static_cast<bool>(claimant.connect_and_handshake()));
+    IG_CHECK(!claimant.acquire_lease().has_value());
+    IG_CHECK_EQ(running.coordinator.epoch().value(), before.value());
+    IG_CHECK_EQ(persisted_epoch(directory.path()).value(), before.value());
+
+    auto ack = publish_one(holder, grant.value());
+    IG_REQUIRE(ack.has_value());
+    IG_CHECK(ack.value().accepted);
+
+    claimant.close();
+    holder.close();
+    running.shutdown();
+}
+
+IG_TEST(integration, a_publish_from_another_incarnation_cannot_revoke_the_holders_lease) {
+    CoordinatorConfig config{};
+    config.lease_duration = Duration{5'000'000'000};
+    RunningCoordinator running(config);
+    IG_REQUIRE(running.start());
+
+    GovernorWorker holder(worker_config_for(running.coordinator, "lease-holder", 41));
+    IG_REQUIRE(static_cast<bool>(holder.connect_and_handshake()));
+    auto grant = holder.acquire_lease();
+    IG_REQUIRE(grant.has_value());
+
+    // A process that does not hold the lease names it, under an epoch that is
+    // not the coordinator's: a worker left over from an earlier incarnation
+    // whose lease number has since been issued to someone else.
+    {
+        net::Connection connection;
+        IG_REQUIRE(static_cast<bool>(connection.connect_loopback(running.coordinator.port())));
+        FramedChannel channel(std::move(connection));
+        MessageDecisionPublish stale{};
+        stale.lease = grant.value().lease;
+        stale.epoch = EpochId{grant.value().epoch.value() + 7};
+        stale.boot = mint_boot_incarnation();
+        stale.worker = mint_worker_id("left-over");
+        stale.destination = DestinationId{41};
+        stale.window = WindowId{1};
+        stale.window_generation = WindowGeneration{1};
+        stale.sequence = 1;
+        Frame frame{};
+        frame.type = FrameType::DecisionPublish;
+        frame.payload = encode_decision_publish(stale);
+        IG_REQUIRE(static_cast<bool>(channel.send(frame)));
+        auto reply = channel.receive();
+        IG_REQUIRE(reply.has_value());
+        IG_REQUIRE(reply.value().type == FrameType::DecisionAck);
+        auto ack = decode_decision_ack(reply.value().payload);
+        IG_REQUIRE(ack.has_value());
+        IG_CHECK(!ack.value().accepted);
+        channel.close();
+    }
+
+    // The holder's authority is what the coordinator granted, untouched.
+    auto ack = publish_one(holder, grant.value());
+    IG_REQUIRE(ack.has_value());
+    IG_CHECK(ack.value().accepted);
+    IG_CHECK(ack.value().reason == RefusalReason::None);
+    IG_CHECK(!holder.fenced());
+    IG_CHECK_EQ(running.coordinator.live_lease_count(), 1u);
+
+    holder.close();
+    running.shutdown();
+}
+
+IG_TEST(integration, connections_beyond_the_configured_bound_are_refused) {
+    CoordinatorConfig config{};
+    config.max_connections = 2;
+    RunningCoordinator running(config);
+    IG_REQUIRE(running.start());
+
+    GovernorWorker first(worker_config_for(running.coordinator, "bound-first", 51));
+    GovernorWorker second(worker_config_for(running.coordinator, "bound-second", 52));
+    IG_REQUIRE(static_cast<bool>(first.connect_and_handshake()));
+    IG_REQUIRE(static_cast<bool>(second.connect_and_handshake()));
+
+    // Both sessions are open and idle, so a third peer is not served.
+    GovernorWorker third(worker_config_for(running.coordinator, "bound-third", 53));
+    IG_CHECK(!static_cast<bool>(third.connect_and_handshake()));
+    third.close();
+
+    // Ending one session frees its place.
+    first.close();
+    bool admitted = false;
+    for (int attempt = 0; attempt < 500 && !admitted; ++attempt) {
+        GovernorWorker next(worker_config_for(running.coordinator, "bound-next", 54));
+        admitted = static_cast<bool>(next.connect_and_handshake());
+        if (admitted) {
+            IG_CHECK(next.acquire_lease().has_value());
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        next.close();
+    }
+    IG_CHECK(admitted);
+
+    second.close();
+    running.shutdown();
+}
+
+IG_TEST(integration, stopping_ends_sessions_that_are_connected_and_silent) {
+    CoordinatorConfig config{};
+    RunningCoordinator running(config);
+    IG_REQUIRE(running.start());
+
+    GovernorWorker worker(worker_config_for(running.coordinator, "silent", 61));
+    IG_REQUIRE(static_cast<bool>(worker.connect_and_handshake()));
+    IG_REQUIRE(worker.acquire_lease().has_value());
+
+    // The worker stays connected and sends nothing. Stopping joins the session
+    // that serves it, so the session has to be ended, not waited for.
+    const auto started = std::chrono::steady_clock::now();
+    running.shutdown();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - started);
+    IG_CHECK(elapsed.count() < 30);
+
+    // The coordinator closed the session: the worker's next exchange fails.
+    IG_CHECK(!static_cast<bool>(worker.send_heartbeat()));
+    worker.close();
 }

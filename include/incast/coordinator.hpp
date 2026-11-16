@@ -256,12 +256,18 @@ private:
     [[nodiscard]] Status handle_connection(FramedChannel& channel);
     [[nodiscard]] Status handle_control(FramedChannel& channel, const ControlRequest& request);
     [[nodiscard]] Outcome<MessageLeaseGrant> grant_lease(const MessageLeaseRequest& request, Timestamp now);
+    // Moves to the next epoch. The ledger is written first, and the epoch only
+    // changes once that write has succeeded. Requires mutex_.
+    [[nodiscard]] Status advance_epoch_locked();
+    // Joins the threads of sessions that have ended. Called by run() only.
+    void reap_finished_sessions();
 
     CoordinatorConfig config_{};
     std::uint16_t port_ = 0;
     net::Listener listener_{};
     BootIncarnation boot_{};
-    std::uint64_t next_session_ = 1;
+    // Handed out by every session thread.
+    std::atomic<std::uint64_t> next_session_{1};
     std::uint64_t next_lease_ = 1;
 
     // Guards the epoch and the lease table only. Never held across a socket
@@ -277,6 +283,9 @@ private:
     // never be acquired in opposite orders.
     mutable std::mutex sessions_mutex_{};
     std::vector<std::shared_ptr<FramedChannel>> sessions_{};
+    // Threads whose session has ended and that only remain to be joined.
+    std::vector<std::thread::id> finished_{};
+    // Owned by the thread inside run().
     std::vector<std::thread> workers_{};
 
     std::atomic<bool> stopping_{false};

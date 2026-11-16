@@ -415,3 +415,188 @@ IG_TEST(durable, journal_record_codec_rejects_damage) {
     IG_CHECK(decode_journal_record(empty, type, body, consumed).error().code ==
              ErrorCode::TruncatedInput);
 }
+
+namespace {
+
+// A state that carries a retained intervention table of the given size. With
+// 64 senders one intervention encodes to a little under two kilobytes.
+GovernorState make_state_with_interventions(std::size_t count) {
+    GovernorState state = make_state_with_intervention();
+    IG_REQUIRE(!state.interventions.empty());
+    Intervention retained = state.interventions.front();
+    retained.state = InterventionState::Retired;
+    state.interventions.clear();
+    for (std::size_t index = 0; index < count; ++index) {
+        retained.id = InterventionId{static_cast<std::uint64_t>(index) + 1};
+        state.interventions.push_back(retained);
+    }
+    return state;
+}
+
+std::vector<std::byte> journal_file_with(const GovernorState& state) {
+    std::vector<std::byte> content;
+    for (const char character : std::string_view("IGJRNL01")) {
+        content.push_back(static_cast<std::byte>(static_cast<unsigned char>(character)));
+    }
+    content.push_back(static_cast<std::byte>(kJournalFormatVersion & 0xFFu));
+    content.push_back(static_cast<std::byte>((kJournalFormatVersion >> 8) & 0xFFu));
+    content.push_back(std::byte{0});
+    content.push_back(std::byte{0});
+    const auto record = encode_journal_record(JournalRecordType::StateCommit, encode_state(state));
+    content.insert(content.end(), record.begin(), record.end());
+    return content;
+}
+
+}  // namespace
+
+IG_TEST(durable, a_state_inside_the_state_bound_is_committed_and_recovered) {
+    TempDirectory directory("large-state");
+    DurableConfig config{};
+    config.directory = directory.path();
+    config.fsync_on_commit = false;
+
+    // Four hundred retained interventions: several times one intervention's
+    // record bound, and far inside the four megabyte state bound.
+    const GovernorState large = make_state_with_interventions(400);
+    const std::size_t encoded = encode_state(large).size();
+    IG_CHECK(encoded > kMaxJournalRecordBytes);
+    IG_CHECK(encoded < config.max_state_bytes);
+    {
+        DurableStore store;
+        IG_REQUIRE(static_cast<bool>(store.open(config)));
+        const Status committed = store.commit(large);
+        IG_REQUIRE(static_cast<bool>(committed));
+    }
+
+    DurableStore reopened;
+    IG_REQUIRE(static_cast<bool>(reopened.open(config)));
+    auto report = reopened.recover();
+    IG_REQUIRE(report.has_value());
+    IG_CHECK(report.value().recovered_committed_state);
+    IG_CHECK_EQ(report.value().state.interventions.size(), 400u);
+    IG_CHECK_EQ(report.value().state.generation.value(), large.generation.value());
+}
+
+IG_TEST(durable, commits_after_a_discarded_tail_are_recovered) {
+    for (const bool complete_but_corrupt : {false, true}) {
+        TempDirectory directory(complete_but_corrupt ? "tail-ambiguous" : "tail-torn");
+        DurableConfig config{};
+        config.directory = directory.path();
+        config.max_journal_records_before_snapshot = 1'000'000;
+
+        GovernorState first = make_state_with_intervention();
+        {
+            DurableStore store;
+            IG_REQUIRE(static_cast<bool>(store.open(config)));
+            IG_REQUIRE(static_cast<bool>(store.commit(first)));
+        }
+        // The process died inside its next append.
+        {
+            std::ofstream stream(directory.path() / "governor.1.journal", std::ios::binary | std::ios::app);
+            IG_REQUIRE(stream.good());
+            if (complete_but_corrupt) {
+                const std::vector<std::byte> payload{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+                auto record = encode_journal_record(JournalRecordType::StateCommit, payload);
+                record.back() = std::byte{0xFF};
+                stream.write(reinterpret_cast<const char*>(record.data()),
+                             static_cast<std::streamsize>(record.size()));
+            } else {
+                const char partial[] = "IGR1\x01\x00\x01";
+                stream.write(partial, sizeof(partial) - 1);
+            }
+        }
+
+        // The restarted process recovers, and then keeps committing.
+        GovernorState second = first;
+        second.generation = StateGeneration{first.generation.value() + 1};
+        second.evaluation_count += 1;
+        {
+            DurableStore store;
+            IG_REQUIRE(static_cast<bool>(store.open(config)));
+            auto report = store.recover();
+            IG_REQUIRE(report.has_value());
+            IG_CHECK(report.value().journal_tail_bytes_discarded > 0);
+            IG_CHECK_EQ(report.value().state.generation.value(), first.generation.value());
+            IG_REQUIRE(static_cast<bool>(store.commit(second)));
+        }
+
+        // What it was told is durable has to be there after the next restart.
+        DurableStore reopened;
+        IG_REQUIRE(static_cast<bool>(reopened.open(config)));
+        auto report = reopened.recover();
+        IG_REQUIRE(report.has_value());
+        IG_CHECK_EQ(report.value().state.generation.value(), second.generation.value());
+        IG_CHECK_EQ(report.value().state.evaluation_count, second.evaluation_count);
+        IG_CHECK_EQ(report.value().journal_tail_bytes_discarded, 0u);
+    }
+}
+
+IG_TEST(durable, a_journal_never_outgrows_what_recovery_reads) {
+    TempDirectory directory("journal-size");
+    DurableConfig config{};
+    config.directory = directory.path();
+    config.fsync_on_commit = false;
+    // Only the size of the journal can force a checkpoint in this run.
+    config.max_journal_records_before_snapshot = 1'000'000;
+
+    // About 190 KiB per commit: 400 commits write well over 64 MiB.
+    GovernorState state = make_state_with_interventions(100);
+    const std::size_t encoded = encode_state(state).size();
+    IG_CHECK(encoded < kMaxJournalRecordBytes);
+    IG_CHECK(encoded * 400 > (64u << 20));
+    {
+        DurableStore store;
+        IG_REQUIRE(static_cast<bool>(store.open(config)));
+        for (std::uint64_t index = 1; index <= 400; ++index) {
+            state.generation = StateGeneration{index};
+            state.evaluation_count = index;
+            IG_REQUIRE(static_cast<bool>(store.commit(state)));
+        }
+    }
+
+    DurableStore reopened;
+    IG_REQUIRE(static_cast<bool>(reopened.open(config)));
+    auto report = reopened.recover();
+    IG_REQUIRE(report.has_value());
+    IG_CHECK(report.value().recovered_committed_state);
+    IG_CHECK_EQ(report.value().state.generation.value(), 400u);
+    IG_CHECK_EQ(report.value().state.evaluation_count, 400u);
+}
+
+IG_TEST(durable, a_superseded_journal_left_behind_never_overrides_the_snapshot) {
+    TempDirectory directory("stale-journal");
+    DurableConfig config{};
+    config.directory = directory.path();
+    config.max_journal_records_before_snapshot = 3;
+
+    GovernorState state = make_state_with_intervention();
+    {
+        DurableStore store;
+        IG_REQUIRE(static_cast<bool>(store.open(config)));
+        // Two full rotations: the snapshot holds generation 6 and the journal
+        // that follows it is still empty.
+        for (std::uint64_t index = 1; index <= 6; ++index) {
+            state.generation = StateGeneration{index};
+            state.evaluation_count = index;
+            IG_REQUIRE(static_cast<bool>(store.commit(state)));
+        }
+    }
+    IG_CHECK(std::filesystem::exists(directory.path() / "governor.snapshot"));
+    IG_CHECK(!std::filesystem::exists(directory.path() / "governor.1.journal"));
+
+    // The first journal was never removed: its removal failed, or the process
+    // died between creating its successor and removing it.
+    GovernorState old = state;
+    old.generation = StateGeneration{2};
+    old.evaluation_count = 2;
+    IG_REQUIRE(static_cast<bool>(
+        write_file_atomic(directory.path() / "governor.1.journal", journal_file_with(old), true)));
+
+    DurableStore reopened;
+    IG_REQUIRE(static_cast<bool>(reopened.open(config)));
+    auto report = reopened.recover();
+    IG_REQUIRE(report.has_value());
+    IG_CHECK(report.value().snapshot_loaded);
+    IG_CHECK_EQ(report.value().state.generation.value(), 6u);
+    IG_CHECK_EQ(report.value().state.evaluation_count, 6u);
+}
